@@ -441,6 +441,8 @@ class NPUWorker(GPUWorker):
         return apply_process_metrics_level(level)
 
     def sleep(self, level: int = 1) -> None:
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("sleep", allow_registered=False)
         self.synchronize_device()
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         # Level-1 only offloads the weights pool. Persistent metadata such as
@@ -477,6 +479,8 @@ class NPUWorker(GPUWorker):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("wake up")
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
             raise ValueError(
@@ -517,6 +521,10 @@ class NPUWorker(GPUWorker):
     def init_weight_transfer_engine(self, init_info: dict) -> None:
         """Initialize the HCCL weight transfer process group with the trainer."""
         self._check_weight_transfer_engine()
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("initialize a transfer engine")
+        if self._weight_update_active:
+            raise RuntimeError("Cannot initialize a transfer engine during an update")
         assert self.weight_transfer_engine is not None
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
@@ -533,6 +541,8 @@ class NPUWorker(GPUWorker):
     def start_weight_update(self) -> None:
         """Begin a new weight update; prepares the model for layerwise reload."""
         self._check_weight_transfer_engine()
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("reload base model weights", allow_registered=False)
 
         if self._weight_update_active:
             raise RuntimeError(
@@ -542,12 +552,16 @@ class NPUWorker(GPUWorker):
         self._check_nz_disabled()
 
         assert self.weight_transfer_engine is not None
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._incomplete_weight_updates.add(False)
         self.weight_transfer_engine.start_weight_update()
         self._weight_update_active = True
 
     def update_weights(self, update_info: dict) -> None:
         """Receive a chunk of weights from the trainer and load them in place."""
         self._check_weight_transfer_engine()
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("update base model weights", allow_registered=False)
         assert self.weight_transfer_engine is not None
 
         # state machine driven by start/finish.
@@ -563,6 +577,8 @@ class NPUWorker(GPUWorker):
     def finish_weight_update(self) -> None:
         """Finish the current weight update; runs layerwise postprocessing."""
         self._check_weight_transfer_engine()
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("finish a base model weight update", allow_registered=False)
 
         if not self._weight_update_active:
             raise RuntimeError("start_weight_update must be called before finish_weight_update.")
@@ -574,6 +590,8 @@ class NPUWorker(GPUWorker):
         else:
             self.model_runner.on_target_weights_replaced()
         self._weight_update_active = False
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._incomplete_weight_updates.discard(False)
 
     def shutdown(self) -> None:
         model = getattr(getattr(self, "model_runner", None), "model", None)
@@ -1270,6 +1288,8 @@ class NPUWorker(GPUWorker):
         return {prefix + name: digest for name, digest in digests.items()}
 
     def reset_weights(self) -> None:
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("reset base model weights", allow_registered=False)
         if get_ascend_config().weight_nz_mode:
             logger.warning(
                 "weight_nz_mode is enabled: weight transfer update is unavailable, "
@@ -1443,9 +1463,13 @@ class NPUWorker(GPUWorker):
             self.profiler.stop()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
+        if hasattr(GPUWorker, "_check_lora_adapter_load"):
+            self._check_lora_adapter_load(lora_request)
         return self.model_runner.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
+        if hasattr(GPUWorker, "_check_lora_adapter_remove"):
+            self._check_lora_adapter_remove(lora_id)
         return self.model_runner.remove_lora(lora_id)
 
     def list_loras(self) -> set[int]:
@@ -1531,6 +1555,8 @@ class NPUWorker(GPUWorker):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        if hasattr(GPUWorker, "_check_lora_update_idle"):
+            self._check_lora_update_idle("reload base model weights", allow_registered=False)
         self.model_runner.reload_weights(*args, **kwargs)
 
     def check_health(self) -> None:

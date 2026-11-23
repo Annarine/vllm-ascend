@@ -1,5 +1,6 @@
 import importlib
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
@@ -22,6 +23,15 @@ from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
 
 init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
 kw_module = importlib.import_module("vllm_ascend.model_executor.warmup.kernel_warmup")
+
+
+def _initialize_worker_weight_update_state(worker, *args, **kwargs):
+    """Seed shared lifecycle state when a legacy fixture bypasses device init."""
+    worker._weight_update_active = False
+    worker._incomplete_weight_updates = set()
+    worker._lora_update_session = None
+    worker._lora_update_failed = False
+    worker._lora_update_versions = {}
 
 
 class TestPPSequenceParallelTransport(unittest.TestCase):
@@ -445,7 +455,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create a simple worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.cache_config = MagicMock()
 
@@ -468,7 +478,7 @@ class TestNPUWorker(TestBase):
         mock_get_config.return_value = SimpleNamespace(
             rl_config=SimpleNamespace(enabled=True, sleep_mode_extra_cleanup=True)
         )
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
         worker.model_runner = MagicMock()
         worker.model_runner.model.named_buffers.return_value = []
@@ -511,7 +521,7 @@ class TestNPUWorker(TestBase):
         mock_model_runner.model = MagicMock()
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = mock_model_runner
             worker.vllm_config = mock_vllm_config
@@ -546,7 +556,7 @@ class TestNPUWorker(TestBase):
         mock_allocator = MagicMock()
         mock_allocator_class.get_instance.return_value = mock_allocator
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
         worker.model_runner = SimpleNamespace(model=MagicMock())
         worker._sleep_saved_buffers = {}
@@ -623,7 +633,7 @@ class TestNPUWorker(TestBase):
             rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=True),
         )
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
         worker.model_runner = SimpleNamespace(
             model=target_model,
@@ -696,7 +706,7 @@ class TestNPUWorker(TestBase):
         mock_current_platform.device_type = "npu"
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.local_rank = 0
             worker.model_config = MagicMock()
@@ -737,7 +747,7 @@ class TestNPUWorker(TestBase):
         wrapper_context = wrapper.return_value
 
         with (
-            patch.object(NPUWorker, "__init__", lambda self, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch.object(NPUWorker, "_init_device", return_value=device),
             patch("vllm_ascend.worker.worker.init_workspace_manager"),
             patch("vllm_ascend.worker.worker.report_usage_stats") as report_usage_stats,
@@ -779,7 +789,7 @@ class TestNPUWorker(TestBase):
             profiler="torch",
             torch_profiler_dir="/path/to/traces",
         )
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.profiler_config = profiler_config
             worker.rank = 0
@@ -798,7 +808,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock - profiler_config indicates profiling disabled
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.profiler = None
             worker.profiler_config = ProfilerConfig(profiler=None, torch_profiler_dir="")
@@ -820,7 +830,7 @@ class TestNPUWorker(TestBase):
         vllm_config_mock = MagicMock()
         vllm_config_mock.profiler_config = profiler_config
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.profiler_config = profiler_config
             worker.profiler = None
@@ -850,7 +860,7 @@ class TestNPUWorker(TestBase):
         vllm_config_mock.profiler_config = profiler_config
 
         with patch("vllm_ascend.worker.worker.TorchNPUProfilerWrapper") as mock_profiler_wrapper:
-            with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
                 worker = NPUWorker()
                 worker.profiler_config = profiler_config
                 worker.profiler = None
@@ -879,7 +889,7 @@ class TestNPUWorker(TestBase):
         )
         mock_profiler = MagicMock()
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.profiler_config = profiler_config
             worker.profiler = None
@@ -912,7 +922,7 @@ class TestNPUWorker(TestBase):
             torch_profiler_dir="/path/to/traces",
         )
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.profiler_config = profiler_config
             worker.profiler = None
@@ -926,7 +936,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             mock_model_runner = MagicMock()
             worker.model_runner = mock_model_runner
@@ -958,7 +968,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.vllm_config = MagicMock(kv_transfer_config=None)
             mock_model_runner = MagicMock()
@@ -986,7 +996,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.compilation_config = MagicMock()
             worker.compilation_config.cudagraph_mode = MagicMock()
@@ -1202,7 +1212,7 @@ class TestNPUWorker(TestBase):
         mock_init_snapshot.total_memory = 10000
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker._kvpp_cache_allocation_plan = None
             worker.vllm_config = MagicMock(attention_config=AttentionConfig(), kv_transfer_config=None)
@@ -1247,7 +1257,7 @@ class TestNPUWorker(TestBase):
         planned_kv_cache_memory = 4 << 30
         mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker._kvpp_cache_allocation_plan = None
             worker.vllm_config = MagicMock(attention_config=AttentionConfig(), kv_transfer_config=None)
@@ -1308,7 +1318,7 @@ class TestNPUWorker(TestBase):
         mock_init_snapshot.total_memory = 10000
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker._kvpp_cache_allocation_plan = None
             worker.vllm_config = MagicMock(attention_config=AttentionConfig(), kv_transfer_config=None)
@@ -1359,7 +1369,7 @@ class TestNPUWorker(TestBase):
         mock_init_snapshot.total_memory = 10000
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker._kvpp_cache_allocation_plan = None
             worker.init_snapshot = mock_init_snapshot
@@ -1417,7 +1427,7 @@ class TestNPUWorker(TestBase):
         mock_init_snapshot.total_memory = 10000
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker._kvpp_cache_allocation_plan = None
             worker.vllm_config = MagicMock(attention_config=AttentionConfig(), kv_transfer_config=None)
@@ -1447,7 +1457,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch("vllm_ascend.worker.worker.get_pp_group") as mock_get_pp_group,
             patch("vllm_ascend.worker.worker.get_ascend_config") as mock_get_ascend_config,
         ):
@@ -1493,7 +1503,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch("vllm_ascend.worker.worker.get_pp_group") as mock_get_pp_group,
             patch("vllm_ascend.worker.worker.get_ascend_config") as mock_get_ascend_config,
         ):
@@ -1550,7 +1560,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.use_v2_model_runner = False
@@ -1605,7 +1615,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch("vllm_ascend.worker.worker.get_pp_group") as mock_get_pp_group,
             patch("vllm_ascend.worker.worker.get_ascend_config") as mock_get_ascend_config,
         ):
@@ -1646,7 +1656,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
@@ -1676,7 +1686,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
@@ -1694,7 +1704,7 @@ class TestNPUWorker(TestBase):
         """Joining prewarm threads belongs to the shared model load, not the worker."""
         from vllm_ascend.worker.worker import NPUWorker
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
@@ -1715,7 +1725,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
@@ -1757,7 +1767,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch.object(kw_module, "kernel_warmup") as mock_kernel_warmup,
         ):
             worker = NPUWorker()
@@ -1823,7 +1833,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch.object(kw_module, "kernel_warmup") as mock_kernel_warmup,
         ):
             worker = NPUWorker()
@@ -1873,7 +1883,7 @@ class TestNPUWorker(TestBase):
         )
 
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch.object(kw_module, "kernel_warmup") as mock_kernel_warmup,
             patch("vllm_ascend.worker.worker.maybe_save_startup_plan") as mock_save_startup_plan,
             patch("vllm_ascend.worker.worker.get_ascend_config") as mock_get_ascend_config,
@@ -1916,7 +1926,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized"),
         ):
             worker = NPUWorker()
@@ -2011,7 +2021,7 @@ class TestNPUWorker(TestBase):
 
         # Create worker mock
         with (
-            patch.object(NPUWorker, "__init__", lambda x, **kwargs: None),
+            patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state),
             patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized"),
         ):
             worker = NPUWorker()
@@ -2041,7 +2051,7 @@ class TestNPUWorker(TestBase):
         """MRV2 KV-zero metadata follows the cache config without spec decode."""
         from vllm_ascend.worker.worker import NPUWorker
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.vllm_config = MagicMock()
@@ -2078,7 +2088,7 @@ class TestNPUWorker(TestBase):
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
             worker.use_v2_model_runner = False
@@ -2126,7 +2136,7 @@ class TestNPUWorker(TestBase):
         """Test update_config delegates to model_runner.update_config"""
         from vllm_ascend.worker.worker import NPUWorker
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
 
@@ -2139,7 +2149,7 @@ class TestNPUWorker(TestBase):
         """Test reload_weights delegates to model_runner.reload_weights"""
         from vllm_ascend.worker.worker import NPUWorker
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
 
@@ -2154,7 +2164,7 @@ class TestNPUWorkerWeightUpdate(TestBase):
     def _make_worker(self, engine=None):
         from vllm_ascend.worker.worker import NPUWorker
 
-        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+        with patch.object(NPUWorker, "__init__", _initialize_worker_weight_update_state):
             worker = NPUWorker()
         worker.weight_transfer_engine = engine
         worker._weight_update_active = False
@@ -2163,6 +2173,140 @@ class TestNPUWorkerWeightUpdate(TestBase):
         worker.model_runner.model = MagicMock()
         worker.model_config = MagicMock()
         return worker
+
+    @staticmethod
+    def _has_shared_lora_guards():
+        from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+
+        return hasattr(GPUWorker, "_check_lora_update_idle")
+
+    def test_active_or_failed_lora_update_blocks_weight_and_residency_changes(self):
+        from vllm.lora.request import LoRARequest
+
+        if not self._has_shared_lora_guards():
+            worker = self._make_worker(engine=MagicMock())
+            worker._lora_update_session = object()
+            with patch("vllm_ascend.worker.worker.get_ascend_config") as config:
+                config.return_value.weight_nz_mode = 0
+                worker.start_weight_update()
+            self.assertTrue(worker._weight_update_active)
+            worker.weight_transfer_engine.start_weight_update.assert_called_once_with()
+            return
+
+        for state in ("active", "failed"):
+            with self.subTest(state=state):
+                engine = MagicMock()
+                worker = self._make_worker(engine=engine)
+                worker._lora_update_session = object() if state == "active" else None
+                worker._lora_update_failed = state == "failed"
+                request = LoRARequest("policy", 1, "ipc://policy", load_inplace=True)
+                operations = (
+                    partial(worker.init_weight_transfer_engine, {}),
+                    worker.start_weight_update,
+                    partial(worker.update_weights, {}),
+                    worker.finish_weight_update,
+                    worker.sleep,
+                    worker.wake_up,
+                    worker.reload_weights,
+                    worker.reset_weights,
+                    partial(worker.add_lora, request),
+                    partial(worker.remove_lora, 1),
+                )
+                for operation in operations:
+                    with self.assertRaisesRegex(RuntimeError, "incomplete LoRA update"):
+                        operation()
+                self.assertEqual(engine.mock_calls, [])
+                self.assertEqual(worker.model_runner.mock_calls, [])
+
+    def test_installed_memory_adapter_preserves_its_weights_and_residency(self):
+        from vllm.lora.request import LoRARequest
+
+        engine = MagicMock()
+        worker = self._make_worker(engine=engine)
+        request = LoRARequest("policy", 1, "ipc://policy")
+        if not self._has_shared_lora_guards():
+            worker.add_lora(request)
+            worker.remove_lora(1)
+            worker.model_runner.add_lora.assert_called_once_with(request)
+            worker.model_runner.remove_lora.assert_called_once_with(1)
+            return
+
+        from vllm.lora.weight_update import LoRAWeightUpdateRequest
+
+        prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+        worker._lora_update_versions[1] = LoRAWeightUpdateRequest(
+            update_id="policy-1",
+            lora_name="policy",
+            lora_int_id=1,
+            version=1,
+            expected_version=None,
+            peft_config={"r": 2, "lora_alpha": 4, "target_modules": ["q_proj"]},
+            names=[f"{prefix}.lora_A.weight", f"{prefix}.lora_B.weight"],
+            dtype_names=["float32", "float32"],
+            shapes=[[2, 4], [4, 2]],
+        )
+        for operation in (
+            worker.sleep,
+            worker.start_weight_update,
+            partial(worker.update_weights, {}),
+            worker.finish_weight_update,
+            worker.reload_weights,
+            worker.reset_weights,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "memory-only LoRA adapters"):
+                operation()
+        request.load_inplace = True
+        with self.assertRaisesRegex(ValueError, "LoRA update APIs"):
+            worker.add_lora(request)
+        with self.assertRaisesRegex(RuntimeError, "remain pinned"):
+            worker.remove_lora(1)
+        self.assertEqual(engine.mock_calls, [])
+        self.assertEqual(worker.model_runner.mock_calls, [])
+        request.load_inplace = False
+        worker.model_runner.add_lora.return_value = True
+        self.assertTrue(worker.add_lora(request))
+        worker.model_runner.add_lora.assert_called_once_with(request)
+
+    @patch("vllm_ascend.worker.worker.vllm_version_is", return_value=False)
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_base_update_failures_preserve_incomplete_state(self, config, _version):
+        config.return_value.weight_nz_mode = 0
+        for stage in ("start", "update", "finish", "model_hook"):
+            with self.subTest(stage=stage):
+                engine = MagicMock()
+                worker = self._make_worker(engine=engine)
+                if stage == "start":
+                    engine.start_weight_update.side_effect = ValueError("update failed")
+                    operation = worker.start_weight_update
+                else:
+                    worker.start_weight_update()
+                    if stage == "update":
+                        engine.update_weights.side_effect = ValueError("update failed")
+                        operation = partial(worker.update_weights, {})
+                    else:
+                        if stage == "finish":
+                            engine.finish_weight_update.side_effect = ValueError("update failed")
+                        else:
+                            worker.model_runner.on_target_weights_replaced.side_effect = ValueError("update failed")
+                        operation = worker.finish_weight_update
+                with self.assertRaisesRegex(ValueError, "update failed"):
+                    operation()
+                self.assertEqual(False in worker._incomplete_weight_updates, self._has_shared_lora_guards())
+                self.assertEqual(worker._weight_update_active, stage in ("finish", "model_hook"))
+                if self._has_shared_lora_guards():
+                    self.assertTrue(worker.has_incomplete_weight_update())
+
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_successful_full_update_clears_incomplete_state(self, config):
+        config.return_value.weight_nz_mode = 0
+        worker = self._make_worker(engine=MagicMock())
+
+        worker.start_weight_update()
+        self.assertEqual(False in worker._incomplete_weight_updates, self._has_shared_lora_guards())
+        worker.finish_weight_update()
+
+        self.assertEqual(worker._incomplete_weight_updates, set())
+        self.assertFalse(worker._weight_update_active)
 
     def test_check_engine_raises_when_unconfigured(self):
         worker = self._make_worker(engine=None)

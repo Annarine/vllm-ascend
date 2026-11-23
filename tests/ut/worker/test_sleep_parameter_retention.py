@@ -13,6 +13,11 @@ def worker(monkeypatch):
     from vllm_ascend.worker import worker as worker_module
 
     worker = worker_module.NPUWorker.__new__(worker_module.NPUWorker)
+    worker._weight_update_active = False
+    worker._incomplete_weight_updates = set()
+    worker._lora_update_session = None
+    worker._lora_update_failed = False
+    worker._lora_update_versions = {}
     worker.model_config = SimpleNamespace(sleep_preserve_parameter_names=["weight"])
     worker.model_runner = SimpleNamespace(model=torch.nn.Linear(2, 2))
     worker.model_runner.model.register_buffer("scale", torch.tensor([2.0]))

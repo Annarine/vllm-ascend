@@ -233,6 +233,19 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         GEMM of lora'b.
         """
 
+        if y_slice_size < x.shape[-1]:
+            # KDA's per-head b gate can have fewer TP-local rows than the
+            # padded LoRA rank. AscendC expand requires output >= rank.
+            target = y[:, y_offset : y_offset + y_slice_size]
+            if not add_inputs:
+                target.zero_()
+            indices = self._get_token_lora_indices(x)
+            weights = w_t_all[:, 0] if w_t_all.ndim == 4 else w_t_all
+            for slot in range(weights.shape[0]):
+                delta = x.float() @ weights[slot].float().T
+                masked = torch.where((indices == slot)[:, None], delta, 0)
+                target.copy_(target.float() + masked)
+            return
         expand_slice_fun: Callable = self._expand_slice_prefill if self._use_sgmv() else self._expand_slice_decode
         expand_slice_fun(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
 

@@ -10,6 +10,7 @@ from vllm.lora.layers import (
     RowParallelLinearWithLoRA,
 )
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
+from vllm.lora.layers.column_parallel_linear import MergedColumnParallelLinearVariableSliceWithLoRA
 from vllm.lora.layers.utils import _not_fully_sharded_can_replace
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.linear import (
@@ -188,7 +189,11 @@ class _SingleLinearLoRAWrapper(_TransposedLoRABMixin):
         packed_modules_list: list,
         model_config: PretrainedConfig | None,
     ) -> bool:
-        return lora_config.max_loras == 1 and type(source_layer) is maybe_get_oot_by_class(cls.base_layer_cls)
+        return (
+            lora_config.max_loras == 1
+            and type(source_layer) is maybe_get_oot_by_class(cls.base_layer_cls)
+            and not getattr(source_layer, "is_mla_kv_b_proj", False)
+        )
 
 
 class AscendRowParallelLinearWithLoRA(_SingleLinearLoRAWrapper, RowParallelLinearWithLoRA):
@@ -199,8 +204,45 @@ class AscendColumnParallelLinearWithLoRA(_SingleLinearLoRAWrapper, ColumnParalle
     base_layer_cls = ColumnParallelLinear
 
 
+class AscendVariableSliceWithLoRA(MergedColumnParallelLinearVariableSliceWithLoRA):
+    """Keep replicated KDA shards local on vLLM versions without this rule."""
+
+    def __init__(self, base_layer):
+        super().__init__(base_layer)
+        replicated = getattr(base_layer, "replicated_shard_ids", ())
+        self.output_ids = tuple(0 if i in replicated else self.tp_rank for i in range(self.n_slices))
+
+
+class AscendMLAKVBProjWithLoRA(ColumnParallelLinearWithLoRA):
+    """Apply kv_b adapters after Ascend's absorbed query/value BMMs."""
+
+    def apply_mla_absorbed_kv_b_lora(self, x, out, *, qk_nope_head_dim, is_query):
+        a_stacked, b_stacked = self.lora_a_stacked[0], self.lora_b_stacked[0]
+        indices = self.punica_wrapper.token_lora_indices[: x.shape[1]]
+        for slot in range(a_stacked.shape[0]):
+            a = a_stacked[slot, 0]
+            b = b_stacked[slot, 0].view(x.shape[0], -1, b_stacked.shape[-1])
+            if is_query:
+                delta = torch.matmul(x, b[:, :qk_nope_head_dim]) @ a
+            else:
+                delta = torch.matmul(x @ a.T, b[:, qk_nope_head_dim:].transpose(1, 2))
+            out.add_(torch.where((indices == slot)[:, None, None], delta.transpose(0, 1), 0))
+
+    @classmethod
+    @_not_fully_sharded_can_replace
+    def can_replace_layer(cls, source_layer, lora_config, packed_modules_list, model_config=None):
+        return getattr(source_layer, "is_mla_kv_b_proj", False) and super().can_replace_layer(
+            source_layer=source_layer,
+            lora_config=lora_config,
+            packed_modules_list=packed_modules_list,
+            model_config=model_config,
+        )
+
+
 def refresh_all_lora_classes():
     ascend_classes = (
+        AscendMLAKVBProjWithLoRA,
+        AscendVariableSliceWithLoRA,
         AscendRowParallelLinearWithLoRA,
         AscendColumnParallelLinearWithLoRA,
         AscendMergedColumnParallelLinearWithLoRA,

@@ -1032,7 +1032,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # RL keeps it: it is the only source of W_UV/W_UK_T, so every weight
         # update re-derives them from this parameter and the parameter must stay
         # loadable (#15463).
-        if not self.rl_weight_update_enabled:
+        if not self.rl_weight_update_enabled and getattr(self.vllm_config, "lora_config", None) is None:
             dispose_layer(self.kv_b_proj)
         self.preprocess_type = self._resolve_preprocess_type(act_dtype)
 
@@ -1068,6 +1068,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _fused_preprocess_type(self) -> PreprocessType | None:
         """Return the enabled fused preprocess type, or None if it cannot run."""
+        # Fused prologs read base weights and bypass LoRA wrappers.
+        if getattr(self.vllm_config, "lora_config", None) is not None:
+            return None
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         qt = type(quant_method) if quant_method is not None else None
 
@@ -1490,6 +1493,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         )
 
+        lora_input = q_nope.transpose(0, 1)
         if (
             q_nope.dtype in [torch.float16, torch.bfloat16]
             and hasattr(torch_npu, "npu_transpose_batchmatmul")
@@ -1513,9 +1517,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             ql_nope = torch.bmm(q_nope, self.W_UK_T)
             # Convert from (N, B, L) to (B, N, L)
             ql_nope = ql_nope.transpose(0, 1)
+        apply_lora = getattr(self.kv_b_proj, "apply_mla_absorbed_kv_b_lora", None)
+        if apply_lora is not None:
+            apply_lora(lora_input, ql_nope, qk_nope_head_dim=self.qk_nope_head_dim, is_query=True)
         return ql_nope, q_pe
 
     def _v_up_proj(self, x):
+        lora_input = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1)
         if hasattr(torch_npu, "npu_transpose_batchmatmul"):
             # (B, N, L) -> operator transposes internally -> (B, N, V)
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
@@ -1529,6 +1537,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             x = torch.bmm(x, self.W_UV)
             # (N, B, V) -> (B, N * V)
             x = x.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
+        apply_lora = getattr(self.kv_b_proj, "apply_mla_absorbed_kv_b_lora", None)
+        if apply_lora is not None:
+            apply_lora(
+                lora_input,
+                x.view(-1, self.local_num_heads, self.v_head_dim),
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                is_query=False,
+            )
         return x
 
     def _sfa_preprocess_prolog_v3(

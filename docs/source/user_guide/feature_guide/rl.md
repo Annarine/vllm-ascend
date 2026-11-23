@@ -169,6 +169,134 @@ FRACTAL_NZ must be disabled for weight updates. RL mode forces
 `weight_nz_mode=0`; the weight-transfer start path validates the effective
 Ascend configuration.
 
+#### LoRA updates through NPU IPC
+
+NPU IPC can transfer a selected adapter's complete LoRA A/B tensors directly
+from a colocated trainer into an existing rollout engine. The base model stays
+fixed; the trainer does not need to save an adapter checkpoint for each RL
+step. This path reuses the upstream LoRA update lifecycle and changes only the
+device-specific IPC export, reconstruction and synchronization.
+
+This feature requires an upstream vLLM build with the LoRA update APIs,
+`send_lora_weights()`, `supports_lora_weight_updates` and the IPC device hooks.
+The upstream `codex/rl-lora-weight-update-ipc` development branch provides
+these interfaces. Both repositories also need compatible Worker and KV-cache
+APIs before running the model example. This development branch pairs the
+vLLM-Ascend baseline `208d8bb8` with an upstream LoRA branch based on
+`c410543d9ffff03f5f6c4a8c0ae1d3ad082c4a15`, the revision pinned in
+[`.github/vllm-main-verified.commit`](../../../../.github/vllm-main-verified.commit).
+Do not mix this pair with the previous upstream baseline `418af607`; its
+KV-cache interfaces differ. A released upstream build without the LoRA
+interfaces cannot run adapter updates; its existing base-model weight-transfer
+APIs remain available. The example reports this prerequisite before allocating
+either model.
+The training environment also needs the PEFT package (`peft`).
+
+The standalone [transport test](../../../../tests/e2e/pull_request/one_card/rlhf/test_lora_npu_ipc_transport.py)
+checks real cross-process NPU IPC and rollout-owned staging without loading
+an LLM. It does not validate adapter installation or model outputs.
+
+Run the [PEFT training example](../../../../examples/rl/rlhf_lora_npu_ipc.py) on
+one physical NPU with enough free HBM for both the trainer and rollout worker:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 python examples/rl/rlhf_lora_npu_ipc.py
+```
+
+The example sends an initial adapter, performs one optimizer step on its LoRA
+parameters, then sends the next revision. It uses `packed=False`,
+`WeightTransferConfig(backend="npu_ipc")`, LoRA enabled, and
+`additional_config={"rl_config": {"enabled": True}}`. The inference worker is
+a separate process on the same chip. The source exports only the selected PEFT
+adapter, not the trainer's full model parameters.
+
+The standalone [model test](../../../../tests/e2e/pull_request/one_card/rlhf/test_lora_npu_ipc.py)
+also accepts a prepared local GLM5.3-FLASH-BF16 checkpoint. Retain the real BF16
+weights for four decoder layers: three KDA layers and one SFA layer, including
+the layer-3 MoE, with MTP set to 0. The environment needs the existing GLM LoRA
+adaptation and an A3 nativekernel package providing HcPre and HcPost.
+Use TP=PCP=DCP=1, eager execution and FlashComm1 disabled. The test uses eager
+execution and the default TP/PCP/DCP sizes of 1; the command explicitly disables
+FlashComm1:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+python tests/e2e/pull_request/one_card/rlhf/test_lora_npu_ipc.py \
+    --model /path/to/GLM5.3-FLASH-BF16-4layer \
+    --local-files-only --work-dir /path/to/glm-lora-ipc-results \
+    --adapter-modules model.layers.0.self_attn.o_proj \
+    --text-only \
+    --attention-config '{"indexer_kv_dtype":"bf16"}' \
+    --additional-config '{"enable_flashcomm1":false}' \
+    --verify-prefix-cache
+```
+
+This command targets only the layer-0 KDA output projection. It compares IPC
+adapter revisions with the corresponding checkpoint-loaded adapters and checks
+cold and warm prefix-cache behavior. The test first requires finite base-model
+logprobs before updating any adapter. This reduced checkpoint is for functional
+validation and does not establish full-model accuracy.
+
+For HTTP, enable the existing runtime LoRA and IPC serialization opt-ins:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 \
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+vllm serve Qwen/Qwen3-0.6B \
+    --enable-lora --max-loras 1 --max-cpu-loras 1 --max-lora-rank 8 \
+    --enforce-eager --gpu-memory-utilization 0.35 \
+    --weight-transfer-config '{"backend": "npu_ipc"}' \
+    --additional-config '{"rl_config": {"enabled": true}}'
+```
+
+Use `NPUIPCTrainerWeightTransferEngine.trainer_init()` with
+`NPUIPCTrainerInitInfo(rank=0, packed=False)`, an
+`HTTPVLLMWeightSyncClient`, and the adapter-only `WeightSource`. Then call
+`send_lora_weights(request)`. The request declares a stable `lora_name` and
+`lora_int_id`, a unique `update_id`, `version`, `expected_version`, the PEFT
+configuration, and the complete ordered `names`, `dtype_names` and `shapes`
+manifest. The first revision uses `expected_version=None`; later revisions
+name the previously committed version.
+
+The shared control plane performs:
+
+1. `start_lora_weight_update(request)`: drain online generation and clear caches;
+2. `update_lora_weights(...)`: import NPU IPC handles and copy into rollout-owned storage;
+3. `finish_lora_weight_update(update_id)`: prepare every worker before installing
+   the adapter and publishing its version.
+
+Online generation remains paused until an explicit `/resume`. After a
+successful HTTP commit, use `lora_name` as the OpenAI request's `model`.
+Offline updates run between completed `generate()` calls; the engine restores
+the idle state after committing. Generation uses the lightweight identity
+`LoRARequest("policy", 1, "ipc://policy")`, without attaching tensors to each
+request.
+
+The sender freezes a private snapshot, and the receiver makes another owned
+copy before LoRA normalization can scale B in place. Keep the source unchanged
+while its snapshot is being exported. Training-side shards must first be
+materialized as complete PEFT A/B tensors; the inference LoRA loader performs
+its own tensor-parallel slicing.
+
+If receive or prepare fails, call `abort_lora_weight_update(update_id)` to
+discard the candidate and keep the previous adapter. A stale finish or abort
+ID cannot close a different session. If installation fails after commit
+begins, the engine remains unavailable and must restart. Do not resume in an
+unconditional failure handler. If abort is not acknowledged, the sender keeps
+its exported storage alive and refuses another send rather than freeing memory
+that a remote worker might still read.
+
+Initial support is one adapter on ordinary linear layers of a dense or MoE
+base model, with fixed rank, module set and tensor schema, unpacked IPC,
+inference DP=PP=1, and one API process for HTTP. Trainer and rollout must share
+the same physical NPU. Expert and shared-expert adapters, EP, speculative
+decoding, arbitrary pre-sharded payloads and packed LoRA transfers are unsupported.
+The installed memory-only adapter remains pinned for the engine lifetime:
+disk replacement, adapter removal, base-model reloads and sleep are rejected.
+NPU E2E and tensor-parallel correctness require hardware validation; CPU unit
+tests do not establish those results.
+
 #### Sparse HCCL
 
 For sparse checkpoint updates, follow the upstream [Sparse NCCL guide](https://docs.vllm.ai/en/latest/training/weight_transfer/nccl/#sparse-nccl) for patch semantics and the update lifecycle. On Ascend, select `sparse_hccl` and enable RL mode:

@@ -5,7 +5,7 @@
 import os
 import socket
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -28,7 +28,6 @@ from vllm_ascend.distributed.weight_transfer.packed_tensor import (
     packed_npu_ipc_consumer,
     packed_npu_ipc_producer,
 )
-from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -37,6 +36,13 @@ if TYPE_CHECKING:
         VLLMWeightSyncClient,
         WeightSource,
     )
+
+
+def vllm_version_is(target_version: str) -> bool:
+    """Defer release-only compatibility checks until model weights are loaded."""
+    from vllm_ascend.utils import vllm_version_is as check_version
+
+    return check_version(target_version)
 
 
 @dataclass
@@ -101,9 +107,9 @@ class NPUIPCTrainerInitInfo(IPCTrainerInitInfo):
 
 @dataclass
 class NPUIPCWeightTransferUpdateInfo(IPCWeightTransferUpdateInfo):
-    """NPU IPC variant — inherits all fields and validation from the CUDA IPC
-    base class.  No overrides needed; the field types and ``__post_init__`` are
-    identical."""
+    """Upstream IPC metadata plus the existing NPU packed-buffer byte sizes."""
+
+    tensor_sizes: list[int] | None = None
 
 
 class NPUIPCWeightTransferEngine(IPCWeightTransferEngine):
@@ -133,6 +139,58 @@ class NPUIPCWeightTransferEngine(IPCWeightTransferEngine):
         super().__init__(config, vllm_config, device, model)
         self._packed_importer = NPUPackedBufferImporter()
 
+    @property
+    def supports_lora_weight_updates(self) -> bool:
+        """Advertise adapter transport only with the upstream LoRA IPC hooks."""
+        return (
+            not self.packed
+            and hasattr(IPCWeightTransferEngine, "_rebuild_ipc_tensor")
+            and hasattr(IPCTrainerWeightTransferEngine, "send_lora_weights")
+            and hasattr(IPCTrainerWeightTransferEngine, "_initialize_device")
+        )
+
+    def _get_device_uuid(self) -> str:
+        return npu_generate_uuid(self.device.index)
+
+    def _rebuild_ipc_tensor(self, args: tuple) -> torch.Tensor:
+        # Import only on NPU workers, after torch_npu registers its backend.
+        from torch_npu.multiprocessing.reductions import rebuild_npu_tensor
+
+        local_args = list(args)
+        if len(local_args) <= 6:
+            raise ValueError("NPU IPC rebuild arguments do not contain a device index")
+        local_args[6] = self.device.index
+        return rebuild_npu_tensor(*local_args)
+
+    def start_weight_update(self) -> None:
+        """Start the base-model reload without creating a CUDA packed consumer."""
+        if vllm_version_is("0.33.0"):
+            from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+            initialize_layerwise_reload(self.model)
+        else:
+            from vllm.model_executor.model_loader.reload import start_reload
+
+            start_reload(self.model)
+        self._packed_importer.close()
+
+    def finish_weight_update(self) -> None:
+        """Finalize the base model and release this export's NPU IPC mapping."""
+        try:
+            if vllm_version_is("0.33.0"):
+                from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+
+                finalize_layerwise_reload(self.model, self.model_config)
+            else:
+                from vllm.model_executor.model_loader.reload import finish_reload
+
+                finish_reload(self.model, self.model_config, self.device)
+        finally:
+            self._packed_importer.close()
+
+    def shutdown(self) -> None:
+        self._packed_importer.close()
+
     @staticmethod
     def trainer_send_weights(*args: Any, **kwargs: Any) -> None:
         raise NotImplementedError(
@@ -150,19 +208,30 @@ class NPUIPCWeightTransferEngine(IPCWeightTransferEngine):
             update_info: NPU IPC update info containing parameter names,
                 dtypes, shapes, and IPC handles.
         """
-        # Use the worker's assigned device rather than the ambient current
-        # device: the receive path is no longer wrapped in
-        # ``with torch.device(self.device)`` by the caller, so the current
-        # device is not guaranteed to match ``self.device``. The IPC tensors
-        # must be rebuilt on the device the model lives on.
+        weights = self.receive_tensors(update_info)
+
+        mtp_check = nullcontext()
+        if vllm_version_is("0.33.0"):
+            # This module is release-only; avoid importing it on newer main.
+            mtp_validation = import_module("vllm.model_executor.model_loader.mtp_validation")
+            mtp_check = mtp_validation.disable_mtp_completeness_check()
+
+        with mtp_check:
+            self.model.load_weights(weights)
+
+    def receive_tensors(self, update_info: IPCWeightTransferUpdateInfo) -> list[tuple[str, torch.Tensor]]:
+        """Import NPU tensors without applying them to either model or adapter."""
+        if not self.packed and hasattr(IPCWeightTransferEngine, "_rebuild_ipc_tensor"):
+            return super().receive_tensors(update_info)
+
         device_index = self.device.index
-        physical_npu_id = npu_generate_uuid(device_index)
+        physical_npu_id = self._get_device_uuid()
 
         if self.packed:
             if update_info.tensor_sizes is None:
                 raise ValueError("`tensor_sizes` is required when packed=True")
             assert isinstance(update_info.ipc_handles, dict)
-            weights = packed_npu_ipc_consumer(
+            return packed_npu_ipc_consumer(
                 ipc_handle=update_info.ipc_handles,
                 physical_npu_id=physical_npu_id,
                 names=update_info.names,
@@ -173,10 +242,6 @@ class NPUIPCWeightTransferEngine(IPCWeightTransferEngine):
                 importer=self._packed_importer,
             )
         else:
-            # Lazy import: ``rebuild_npu_tensor`` lives in ``torch_npu`` and
-            # must not be imported at module load time on non-NPU hosts.
-            from torch_npu.multiprocessing.reductions import rebuild_npu_tensor
-
             assert isinstance(update_info.ipc_handles, list)
             weights = []
             for name, ipc_handle in zip(
@@ -191,25 +256,9 @@ class NPUIPCWeightTransferEngine(IPCWeightTransferEngine):
                         f"not co-located on the same physical NPU (node)."
                     )
 
-                args = ipc_handle[physical_npu_id]
-                list_args = list(args)
-                # Index 6 is the device_index parameter in torch's
-                # IPC handle tuple (rebuild_npu_tensor). Update it
-                # to the current device since the logical index can
-                # differ between sender and receiver.
-                list_args[6] = device_index
-                weight = rebuild_npu_tensor(*list_args)
+                weight = self._rebuild_ipc_tensor(ipc_handle[physical_npu_id])
                 weights.append((name, weight))
-
-        mtp_check = nullcontext()
-        if vllm_version_is("0.33.0"):
-            # The pinned main tree used by mypy no longer contains this
-            # release-only module. Resolve it only in the release runtime.
-            mtp_validation = import_module("vllm.model_executor.model_loader.mtp_validation")
-            mtp_check = mtp_validation.disable_mtp_completeness_check()
-
-        with mtp_check:
-            self.model.load_weights(weights)
+            return weights
 
 
 class NPUIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
@@ -231,20 +280,46 @@ class NPUIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         packed: bool = False,
         packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     ) -> None:
-        # IPCTrainerWeightTransferEngine.__init__ queries CUDA properties.
-        # Initialize its device-independent base, then supply NPU identity.
-        TrainerWeightTransferEngine.__init__(
-            self,
-            client=client,
-            source=source,
-            is_sender=is_sender,
-        )
-        self.packed = packed
-        self.packed_buffer_size_bytes = packed_buffer_size_bytes
+        if hasattr(IPCTrainerWeightTransferEngine, "_initialize_device"):
+            super().__init__(
+                client=client,
+                source=source,
+                is_sender=is_sender,
+                packed=packed,
+                packed_buffer_size_bytes=packed_buffer_size_bytes,
+            )
+        else:
+            # Released vLLM queries CUDA directly in its IPC constructor and
+            # has no LoRA IPC API; keep its existing base-weight path working.
+            TrainerWeightTransferEngine.__init__(
+                self,
+                client=client,
+                source=source,
+                is_sender=is_sender,
+            )
+            self.packed = packed
+            self.packed_buffer_size_bytes = packed_buffer_size_bytes
+            self._initialize_device()
+
+    def _initialize_device(self) -> None:
         self.device_index = torch.accelerator.current_device_index()
+        self.device = torch.device("npu", self.device_index)
         self.npu_uuid = npu_generate_uuid(self.device_index)
         # Upstream's unpacked sender treats gpu_uuid as an opaque wire key.
         self.gpu_uuid = self.npu_uuid
+
+    def _export_ipc_tensor(self, tensor: torch.Tensor) -> tuple:
+        from torch_npu.multiprocessing.reductions import rebuild_npu_tensor
+
+        # torch_npu replaces this module attribute when it registers its IPC
+        # reducer. Reading it here avoids a stale CUDA-only imported alias.
+        rebuild, args = torch.multiprocessing.reductions.reduce_tensor(tensor)
+        if rebuild is not rebuild_npu_tensor:
+            raise ValueError("The NPU IPC reducer did not produce an NPU tensor handle")
+        return args
+
+    def _synchronize_device(self) -> None:
+        torch.npu.synchronize()
 
     def _all_gather_and_merge_handles(
         self,
@@ -258,6 +333,8 @@ class NPUIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
         its args. No-op (returns handles unchanged) when no distributed
         group exists.
         """
+        if hasattr(IPCTrainerWeightTransferEngine, "_synchronize_device"):
+            return super()._all_gather_and_merge_handles(handles)
         if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
             return handles
 
@@ -309,3 +386,32 @@ class NPUIPCTrainerWeightTransferEngine(IPCTrainerWeightTransferEngine):
             # colocated worker is still reading the current chunk, silently
             # corrupting the transfer.
             self._post_send_sync()
+
+    def _do_send(
+        self,
+        names: list[str],
+        dtype_names: list[str],
+        shapes: list[list[int]],
+        ipc_handles: list[dict[str, tuple]] | dict[str, tuple],
+        tensor_sizes: list[int] | None = None,
+    ) -> None:
+        """Keep the NPU packed wire format while reusing upstream unpacked sends."""
+        if tensor_sizes is None:
+            super()._do_send(
+                names=names,
+                dtype_names=dtype_names,
+                shapes=shapes,
+                ipc_handles=ipc_handles,
+            )
+        elif self.is_sender:
+            self.client.update_weights(
+                asdict(
+                    NPUIPCWeightTransferUpdateInfo(
+                        names=names,
+                        dtype_names=dtype_names,
+                        shapes=shapes,
+                        ipc_handles=ipc_handles,
+                        tensor_sizes=tensor_sizes,
+                    )
+                )
+            )

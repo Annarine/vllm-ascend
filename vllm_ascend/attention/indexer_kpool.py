@@ -335,6 +335,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         """
         return (
             self.tp_size > 1
+            and getattr(self.vllm_config, "lora_config", None) is None
             and self.pcp_size == 1
             and self.vllm_config.parallel_config.decode_context_parallel_size == 1
             and not graph_capture
@@ -836,20 +837,34 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self.kpool_int8 = getattr(self.k_cache, "dtype", torch.bfloat16) == torch.int8
         self.tail_cache: Any = vllm_indexer.tail_cache
         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
+        self.use_lora = getattr(vllm_indexer.vllm_config, "lora_config", None) is not None
         # Reserve the shared exchange workspace at model-build time: backend
         # init runs before the memory profile on every runner, so the KV-cache
         # budget accounts for the worst sharded step even when profiling skips
         # attention (MRv2). All layers and the draft layers share one pair.
-        if self.topk_indices_buffer is not None and _row_shard_exchange_reservation_supported(
-            parallel_config,
-            vllm_indexer.vllm_config.compilation_config.cudagraph_mode,
+        if (
+            not self.use_lora
+            and self.topk_indices_buffer is not None
+            and _row_shard_exchange_reservation_supported(
+                parallel_config,
+                vllm_indexer.vllm_config.compilation_config.cudagraph_mode,
+            )
         ):
             _ensure_row_shard_exchange_workspace(
                 self.topk_indices_buffer,
                 self.topk_output_width,
                 parallel_config.tensor_parallel_size,
             )
-        self._init_cann_ops()
+        if self.use_lora:
+            if self.k_cache.dtype != torch.bfloat16:
+                raise NotImplementedError("GLM-5.3 LoRA requires a BF16 indexer cache (indexer_kv_dtype=bf16).")
+            # Lazy import: the unfused path consumes per-token LoRA projections
+            # before normalization and pooling; CANN key_pool reads base weights.
+            from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
+
+            self._lora_indexer = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim)
+        else:
+            self._init_cann_ops()
         self._head_weight_f32 = None
 
     @property
@@ -949,6 +964,11 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         if not isinstance(tail_metadata, AscendIndexerKPoolTailMetadata):
             raise TypeError("GLM KPool backend requires tail-cache metadata.")
 
+        if self.use_lora:
+            return self._forward_lora(
+                hidden_states, q_c, k_hidden_states, indexer_metadata, tail_metadata, compute_topk
+            )
+
         # SFA owns token trimming, including padded PCP and graph query rows.
         if isinstance(k_hidden_states, torch.Tensor):
             k_hidden_states = self.prepare_pcp_hidden(k_hidden_states, indexer_metadata)
@@ -987,6 +1007,57 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             tail_metadata,
             compute_topk=compute_topk,
             indexer_scale_cache=indexer_scale_cache,
+        )
+
+    def _project_lora(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        base = getattr(self.wk_weights_proj, "base_layer", self.wk_weights_proj)
+        key = F.linear(hidden_states.float(), base.weight[: self.head_dim].float())
+        assert self._head_weight_f32 is not None
+        weights = F.linear(hidden_states.float(), self._head_weight_f32)
+        apply_lora = getattr(self.wk_weights_proj, "_apply_lora_to_output", None)
+        if apply_lora is not None:
+            delta = apply_lora(
+                hidden_states, hidden_states.new_zeros((hidden_states.shape[0], self.head_dim + self.n_head))
+            )
+            key = key + delta[:, : self.head_dim].float()
+            weights = weights + delta[:, self.head_dim :].float()
+        return self.k_norm(key), weights
+
+    def _forward_lora(self, hidden_states, q_c, k_hidden_states, metadata, tail_metadata, compute_topk):
+        if metadata.indexer_row_shard is not None or metadata.write_metadata is not None:
+            raise NotImplementedError("GLM-5.3 LoRA indexer requires replicated query rows and no PCP/DCP.")
+        if isinstance(q_c, tuple):
+            raise TypeError("GLM-5.3 LoRA indexer requires unquantized q_c.")
+        if self._head_weight_f32 is None:
+            self.process_weights_after_loading()
+        k_hidden = k_hidden_states if isinstance(k_hidden_states, torch.Tensor) else k_hidden_states()
+        if k_hidden.shape != hidden_states.shape:
+            raise ValueError("GLM-5.3 LoRA requires aligned query and key token rows.")
+        keys, weights = self._project_lora(k_hidden)
+        q_values = self.wq_b(q_c)[0].view(-1, self.n_head, self.head_dim) if compute_topk else None
+        if compute_topk:
+            assert q_values is not None
+            weights = weights.to(q_values.dtype) * (self.softmax_scale * self.n_head**-0.5)
+        gate = F.linear(k_hidden.float(), self.index_kpool_compress_gate.float())
+        (cache,) = self._bound_caches(self.k_cache)
+        (tail,) = self._bound_caches(self.tail_cache)
+        # Preserve page strides/storage while exposing the two FP32 K/gate planes.
+        tail_view = tail.unflatten(-1, (2, self.head_dim)).permute(0, 2, 1, 3)
+        return self._lora_indexer(
+            keys,
+            q_values,
+            weights if compute_topk else None,
+            metadata.positions,
+            cache,
+            tail_view,
+            metadata,
+            tail_metadata,
+            gate_score=gate,
+            compress_ape=self.index_kpool_compress_ape,
+            index_kpool=self.index_kpool,
+            max_pool_seq_len=metadata.block_table.shape[1] * metadata.block_size,
+            compute_topk=compute_topk,
+            output_buffer=self.topk_indices_buffer,
         )
 
     def _init_cann_ops(self) -> None:

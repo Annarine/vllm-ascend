@@ -222,6 +222,8 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             ascend_indexer = None
         q_projection = mla_modules.q_b_proj if q_lora_rank is not None else mla_modules.q_proj
         self.dcp_q_replicate_enabled = getattr(q_projection, "qrep_active", False) is True
+        if get_current_vllm_config().lora_config is not None:
+            mla_modules.kv_b_proj.is_mla_kv_b_proj = True
         # AscendMLAAttention opts into upstream's PCP+DCP guard by setting the
         # ``supports_pcp_dcp`` ClassVar on the Ascend backend layer (see
         # vllm_ascend.attention.mla_v1) instead of mutating the shared upstream
@@ -264,6 +266,24 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         # Mark before VLLM calls process_weights_after_loading on submodules.
         mark_fused_preprocess_weights(self.mla_attn.impl)
 
+        # Backend impls are not nn.Modules. Keep discoverable aliases so the
+        # LoRA manager can replace every projection, then bind the live wrappers
+        # before execution instead of retaining the original base-layer objects.
+        self._lora_projections = nn.ModuleDict()
+        if get_current_vllm_config().lora_config is not None:
+            for name in (
+                "fused_qkv_a_proj",
+                "q_b_proj",
+                "q_proj",
+                "kv_a_proj_with_mqa",
+                "kv_b_proj",
+                "o_proj",
+                "g_proj",
+            ):
+                projection = getattr(mla_modules, name, None)
+                if projection is not None:
+                    self._lora_projections[name] = projection
+
         original_process_weights = self.mla_attn.process_weights_after_loading
 
         def wrapped_process_weights(act_dtype: torch.dtype | None = None):
@@ -289,6 +309,14 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _bind_lora_projections(self) -> None:
+        impl = self.mla_attn.impl
+        for name, projection in self._lora_projections.items():
+            target = "q_proj" if name == "q_b_proj" else name
+            setattr(impl, target, projection)
+            if name == "kv_b_proj":
+                self.mla_attn.kv_b_proj = projection
 
     def forward(
         self,
@@ -318,6 +346,7 @@ def mla_forward(
         attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
     else:
         attn_metadata = forward_context.attn_metadata
+    self._bind_lora_projections()
     kv_cache = self.mla_attn.kv_cache
     self.mla_attn.impl.forward(self.mla_attn.layer_name, hidden_states, kv_cache, attn_metadata, output)
     return

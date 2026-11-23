@@ -49,6 +49,11 @@ def mock_ascend_config(monkeypatch):
 
 def _make_worker(dp_rank: int) -> NPUWorker:
     worker = object.__new__(NPUWorker)
+    worker._weight_update_active = False
+    worker._incomplete_weight_updates = set()
+    worker._lora_update_session = None
+    worker._lora_update_failed = False
+    worker._lora_update_versions = {}
     worker.parallel_config = ParallelConfig(data_parallel_size=2, data_parallel_rank=dp_rank)
     # Dense DP resets data_parallel_rank to 0 in each engine.
     worker.parallel_config.reconfigure_for_independent_dp_rank()
