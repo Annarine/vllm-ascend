@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Cross-process NPU IPC transport and owned LoRA staging, without an LLM.
+"""Cross-process NPU IPC chunks and owned LoRA staging, without an LLM.
 
 Run directly when a model-level pytest conftest is incompatible with the
 installed upstream runtime:
 
     python tests/e2e/pull_request/one_card/rlhf/test_lora_npu_ipc_transport.py
 
-This exercises real NPU IPC exports, imports and LoRAWeightUpdateSession.consume.
-It deliberately does not call prepare/commit, install an adapter or validate
-model outputs. The manager dependency fails immediately if installation is
-attempted. No vLLM modules or NPU hardware APIs are mocked.
+This exercises real NPU IPC exports/imports, packed base-weight chunks and
+LoRAWeightUpdateSession.consume. It does not reload the model, call adapter
+prepare/commit or validate model outputs. The manager dependency fails immediately
+if installation is attempted. No vLLM modules or NPU hardware APIs are mocked.
 """
 
 import argparse
@@ -66,6 +66,7 @@ class _PipeControlClient:
     def __init__(self, connection: Connection):
         self.connection = connection
         self.verification = None
+        self.base_verification = None
 
     def receive(self):
         if not self.connection.poll(CONTROL_TIMEOUT_SECONDS):
@@ -82,6 +83,15 @@ class _PipeControlClient:
     def init_weight_transfer_engine(self, init_info):
         self.request("init", init_info)
 
+    def start_weight_update(self):
+        self.request("base_start")
+
+    def update_weights(self, update_info):
+        self.request("base_receive", update_info)
+
+    def finish_weight_update(self, weight_version=None):
+        self.base_verification = self.request("verify_base")
+
     def start_lora_weight_update(self, request):
         self.request("start", request)
 
@@ -97,6 +107,14 @@ class _PipeControlClient:
         self.request("abort", update_id)
 
 
+def _packed_values(device):
+    return {
+        "flag": torch.tensor([3], dtype=torch.uint8, device=device),
+        "matrix": torch.arange(4, dtype=torch.float32, device=device).reshape(2, 2).T,
+        "bias": torch.arange(4, dtype=torch.float32, device=device) + 10,
+    }
+
+
 def _consume_in_child(connection: Connection, device_index: int):
     try:
         device = torch.device("npu", device_index)
@@ -108,6 +126,8 @@ def _consume_in_child(connection: Connection, device_index: int):
         receiver = NPUIPCWeightTransferEngine(transfer_config, config, device, model)
         session = None
         imported = {}
+        packed_received = {}
+        packed_chunks = 0
         connection.send({"ready": True, "pid": os.getpid()})
         while True:
             operation, payload = connection.recv()
@@ -117,7 +137,32 @@ def _consume_in_child(connection: Connection, device_index: int):
                 break
             if operation == "init":
                 receiver.init_transfer_engine(receiver.parse_init_info(payload))
-                assert receiver.supports_lora_weight_updates
+                assert receiver.supports_lora_weight_updates == (not payload["packed"])
+            elif operation == "base_start":
+                assert session is None and receiver.packed
+                packed_received.clear()
+                packed_chunks = 0
+            elif operation == "base_receive":
+                assert receiver.packed
+                chunk = receiver.receive_tensors(receiver.parse_update_info(payload))
+                for name, tensor in chunk:
+                    assert name not in packed_received
+                    packed_received[name] = tensor
+                packed_chunks += 1
+                torch.npu.synchronize()
+            elif operation == "verify_base":
+                expected_values = _packed_values(device)
+                assert packed_chunks == 2
+                assert list(packed_received) == list(expected_values)
+                for name, expected in expected_values.items():
+                    torch.testing.assert_close(packed_received[name], expected, rtol=0, atol=0)
+                torch.testing.assert_close(model.weight, original_base, rtol=0, atol=0)
+                receiver.shutdown()
+                torch.npu.synchronize()
+                connection.send(
+                    {"packed_transport_complete": True, "chunks": packed_chunks, "tensor_count": len(packed_received)}
+                )
+                continue
             elif operation == "start":
                 assert session is None
                 spec = LoRAWeightUpdateRequest(**payload)
@@ -234,10 +279,24 @@ def test_npu_lora_ipc_transport_copies_owned_storage(device_index: int = 0):
             }
             for name, tensor in source.tensors.items():
                 torch.testing.assert_close(tensor, original[name], rtol=0, atol=0)
+        packed_tensors = _packed_values(device)
+        original_packed = {name: tensor.clone() for name, tensor in packed_tensors.items()}
+        packed_transfer = NPUIPCTrainerWeightTransferEngine.trainer_init(
+            NPUIPCTrainerInitInfo(rank=0, packed=True, packed_buffer_size_bytes=17),
+            client=client,
+            source=_TensorSource(packed_tensors),
+        )
+        packed_transfer.send_weights()
+        assert client.base_verification == {"packed_transport_complete": True, "chunks": 2, "tensor_count": 3}
+        for name, tensor in packed_tensors.items():
+            torch.testing.assert_close(tensor, original_packed[name], rtol=0, atol=0)
         client.request("shutdown")
         process.join(SHUTDOWN_TIMEOUT_SECONDS)
         assert process.exitcode == 0
-        print("Two NPU IPC snapshots and owned LoRA staging passed; model prepare/commit was not executed.")
+        print(
+            "Two LoRA snapshots, owned staging and two packed IPC chunks passed; "
+            "model reload and adapter prepare/commit were not executed."
+        )
     finally:
         if process.is_alive():
             process.terminate()

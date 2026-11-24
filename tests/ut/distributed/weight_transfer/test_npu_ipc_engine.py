@@ -40,7 +40,7 @@ import os
 import sys
 import types
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import cached_property
@@ -52,7 +52,7 @@ import torch
 from vllm.config import DeviceConfig, VllmConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import ParamMeta, WeightSource, WeightTransferEngine
-from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerWeightTransferEngine
+from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerWeightTransferEngine, IPCWeightTransferEngine
 
 from vllm_ascend.distributed.weight_transfer import npu_ipc_engine
 from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
@@ -130,7 +130,9 @@ def test_unpacked_send_stores_reduce_tensor_args_only():
     with (
         _patch_rebuild_npu_tensor(rebuild),
         patch("torch.multiprocessing.reductions.reduce_tensor", fake_reduce),
-        patch("vllm.distributed.weight_transfer.ipc_engine.reduce_tensor", fake_reduce),
+        patch.object(sys.modules[IPCTrainerWeightTransferEngine.__module__], "reduce_tensor", fake_reduce)
+        if hasattr(sys.modules[IPCTrainerWeightTransferEngine.__module__], "reduce_tensor")
+        else nullcontext(),
     ):
         from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
             NPUIPCTrainerWeightTransferEngine,
@@ -141,6 +143,7 @@ def test_unpacked_send_stores_reduce_tensor_args_only():
         engine.is_sender = True
         engine.npu_uuid = "node-0"
         engine.gpu_uuid = engine.npu_uuid
+        engine.device = torch.device("cpu")
         source = MagicMock()
         source.__iter__.return_value = iter([("model.weight", torch.zeros(3))])
         source.iter_full.return_value = iter([("model.weight", torch.zeros(3))])
@@ -225,7 +228,7 @@ def test_finish_weight_update():
     with _patch_reload_module(finalize=mock_finalize):
         engine.finish_weight_update()
 
-    if vllm_version_is("0.33.0"):
+    if not hasattr(IPCTrainerWeightTransferEngine, "_collect_ipc") and vllm_version_is("0.33.0"):
         mock_finalize.assert_called_once_with(engine.model, engine.model_config)
     else:
         mock_finalize.assert_called_once_with(engine.model, engine.model_config, engine.device)
@@ -233,41 +236,42 @@ def test_finish_weight_update():
 
 
 def test_receive_packed_weights_loads_model():
-    packed_weights = [("model.weight", torch.tensor([1.0, 2.0, 3.0]))]
-    update_info = MagicMock(
+    """The inherited consumer imports NPU bytes and gives the loader owned values."""
+    staging = torch.tensor([1.0, 2.0, 3.0])
+    config = WeightTransferConfig(backend="npu_ipc")
+    model = _PackedWeightSink()
+    engine = NPUIPCWeightTransferEngine(
+        config,
+        VllmConfig(device_config=DeviceConfig(device="cpu"), weight_transfer_config=config),
+        torch.device("cpu:0"),
+        model,
+    )
+    engine.init_transfer_engine(engine.init_info_cls(packed=True))
+    update_info = engine.update_info_cls(
         tensor_sizes=[12],
-        ipc_handles={"node-0": ("packed-handle",)},
+        ipc_handles={"node-0": (None,) * 6 + (999,)},
         names=["model.weight"],
         shapes=[[3]],
         dtype_names=["float32"],
     )
 
-    engine = object.__new__(NPUIPCWeightTransferEngine)
-    engine.model = MagicMock()
-    engine.device = MagicMock(index=0)
-    engine.packed = True
-    engine._packed_importer = MagicMock()
+    def rebuild(*args):
+        assert args[6] == 0
+        return staging.view(torch.uint8)
 
     with (
+        _patch_rebuild_npu_tensor(rebuild),
         patch(f"{_MODULE}.npu_generate_uuid", return_value="node-0"),
-        patch(
-            f"{_MODULE}.packed_npu_ipc_consumer",
-            return_value=packed_weights,
-        ) as mock_consumer,
+        patch("torch.multiprocessing.reductions.rebuild_cuda_tensor", side_effect=AssertionError("CUDA used")),
     ):
         engine.receive_weights(update_info)
 
-    mock_consumer.assert_called_once_with(
-        ipc_handle=update_info.ipc_handles,
-        physical_npu_id="node-0",
-        names=update_info.names,
-        shapes=update_info.shapes,
-        dtype_names=update_info.dtype_names,
-        tensor_sizes=update_info.tensor_sizes,
-        device_index=0,
-        importer=engine._packed_importer,
-    )
-    engine.model.load_weights.assert_called_once_with(packed_weights)
+    assert model.received.keys() == {"model.weight"}
+    torch.testing.assert_close(model.received["model.weight"], staging, rtol=0, atol=0)
+    assert model.received["model.weight"].data_ptr() != staging.data_ptr()
+    staging.zero_()
+    torch.testing.assert_close(model.received["model.weight"], torch.tensor([1.0, 2.0, 3.0]), rtol=0, atol=0)
+    engine.shutdown()
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -333,9 +337,7 @@ def test_receive_tensors_imports_npu_storage_without_loading_base_weights():
         _patch_rebuild_npu_tensor(rebuild),
         patch(f"{_MODULE}.npu_generate_uuid", return_value="node-0"),
         patch.object(torch.cuda, "get_device_properties", side_effect=AssertionError("CUDA used")),
-        patch(
-            "vllm.distributed.weight_transfer.ipc_engine.rebuild_cuda_tensor", side_effect=AssertionError("CUDA used")
-        ),
+        patch("torch.multiprocessing.reductions.rebuild_cuda_tensor", side_effect=AssertionError("CUDA used")),
     ):
         [(name, received)] = engine.receive_tensors(info)
         assert name == "weight"
@@ -370,6 +372,15 @@ class _CPUStorageNPUTrainer(NPUIPCTrainerWeightTransferEngine):
         self.device = torch.device("cpu")
         self.npu_uuid = "node-0"
         self.gpu_uuid = self.npu_uuid
+
+
+class _PackedWeightSink(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.received = {}
+
+    def load_weights(self, weights):
+        self.received.update(weights)
 
 
 class _LoRAControlClient:
@@ -424,10 +435,6 @@ def test_inherited_lora_send_uses_dynamic_npu_reducer_and_retains_owner():
     with (
         _patch_rebuild_npu_tensor(rebuild),
         patch("torch.multiprocessing.reductions.reduce_tensor", side_effect=reduce),
-        patch(
-            "vllm.distributed.weight_transfer.ipc_engine.reduce_tensor",
-            side_effect=AssertionError("stale CUDA reducer used"),
-        ),
         patch.object(torch.cuda, "get_device_properties", side_effect=AssertionError("CUDA used")),
         patch.object(torch.cuda, "ipc_collect", side_effect=AssertionError("CUDA used")),
         patch.object(torch, "npu", types.SimpleNamespace(synchronize=lambda: None), create=True),
@@ -461,6 +468,10 @@ def test_inherited_lora_send_uses_dynamic_npu_reducer_and_retains_owner():
 
 @pytest.mark.parametrize("is_sender", [False, True])
 def test_packed_sender_waits_before_reusing_each_chunk(is_sender):
+    if hasattr(IPCTrainerWeightTransferEngine, "_collect_ipc"):
+        _check_inherited_packed_send(is_sender)
+        return
+
     engine = object.__new__(NPUIPCTrainerWeightTransferEngine)
     engine.client = MagicMock()
     engine.is_sender = is_sender
@@ -490,6 +501,82 @@ def test_packed_sender_waits_before_reusing_each_chunk(is_sender):
     expected_chunk = ["update", "sync", "reuse"] if is_sender else ["sync", "reuse"]
     assert events == expected_chunk * 2
     assert engine.client.update_weights.call_count == (2 if is_sender else 0)
+
+
+def _check_inherited_packed_send(is_sender):
+    """Execute the shared producer, consumer and completion flow on CPU storage."""
+    tensors = {"w0": torch.arange(8.0).reshape(4, 2)[:, 0], "w1": torch.arange(4.0) + 10}
+    originals = {name: tensor.clone() for name, tensor in tensors.items()}
+    events = []
+    exports = []
+    imports = []
+    staging = {}
+    config = WeightTransferConfig(backend="npu_ipc")
+    model = _PackedWeightSink()
+    receiver = NPUIPCWeightTransferEngine(
+        config,
+        VllmConfig(device_config=DeviceConfig(device="cpu"), weight_transfer_config=config),
+        torch.device("cpu:0"),
+        model,
+    )
+    receiver.init_transfer_engine(receiver.init_info_cls(packed=True))
+
+    def rebuild(*args):
+        assert args[6] == 0
+        imports.append(args[-1])
+        return staging[args[-1]].view(-1)
+
+    def reduce(tensor):
+        key = "packed-export"
+        staging[key] = tensor
+        exports.append(tensor.data_ptr())
+        return rebuild, (None,) * 6 + (99, key)
+
+    def receive(payload):
+        assert payload["tensor_sizes"] == [16]
+        receiver.receive_weights(receiver.parse_update_info(payload))
+        events.append("update")
+
+    client = MagicMock()
+    client.start_weight_update.side_effect = lambda: events.append("start")
+    client.update_weights.side_effect = receive
+    client.finish_weight_update.side_effect = lambda: events.append("finish")
+    with (
+        _patch_rebuild_npu_tensor(rebuild),
+        patch("torch.multiprocessing.reductions.reduce_tensor", side_effect=reduce),
+        patch(f"{_MODULE}.npu_generate_uuid", return_value="node-0"),
+        patch.object(torch, "npu", types.SimpleNamespace(synchronize=lambda: events.append("sync")), create=True),
+        patch.object(torch.distributed, "is_initialized", return_value=False),
+        patch.object(torch.cuda, "get_device_properties", side_effect=AssertionError("CUDA used")),
+        patch.object(torch.cuda, "ipc_collect", side_effect=AssertionError("CUDA used")),
+        patch("torch.multiprocessing.reductions.rebuild_cuda_tensor", side_effect=AssertionError("CUDA used")),
+    ):
+        engine = _CPUStorageNPUTrainer(
+            client=client,
+            source=_LoRAOnlySource(tensors),
+            is_sender=is_sender,
+            packed=True,
+            packed_buffer_size_bytes=16,
+        )
+        assert engine._send_packed.__func__ is IPCTrainerWeightTransferEngine._send_packed
+        assert receiver.receive_tensors.__func__ is IPCWeightTransferEngine.receive_tensors
+        engine.send_weights()
+
+    assert len(exports) == 1
+    if is_sender:
+        assert events == ["start", "sync", "update", "sync", "sync", "update", "sync", "finish", "sync"]
+        assert imports == ["packed-export"]
+        assert model.received.keys() == tensors.keys()
+        for name, tensor in model.received.items():
+            torch.testing.assert_close(tensor, originals[name], rtol=0, atol=0)
+            assert tensor.data_ptr() != tensors[name].data_ptr()
+    else:
+        assert events == ["sync"] * 5
+        assert not imports and not model.received
+        client.update_weights.assert_not_called()
+    for name, tensor in tensors.items():
+        torch.testing.assert_close(tensor, originals[name], rtol=0, atol=0)
+    receiver.shutdown()
 
 
 @pytest.mark.parametrize("is_sender", [False, True])
@@ -550,14 +637,15 @@ def _legacy_mtp_validation_fixture():
 
 
 def test_receive_scopes_mtp_completeness_check_to_loading():
-    # This test targets the release-only engine branch on both CPU lanes.
-    # The main branch (no legacy import) is covered by Nov10 contract tests.
+    # Legacy releases temporarily disable the MTP check; the inherited main
+    # path leaves it enabled. Both must preserve the caller's context on error.
     mtp_validation = (
         import_module("vllm.model_executor.model_loader.mtp_validation")
         if vllm_version_is("0.33.0")
         else _legacy_mtp_validation_fixture()
     )
     is_mtp_completeness_check_enabled = mtp_validation.is_mtp_completeness_check_enabled
+    generic_ipc = hasattr(IPCTrainerWeightTransferEngine, "_collect_ipc")
 
     engine = object.__new__(NPUIPCWeightTransferEngine)
     engine.device = types.SimpleNamespace(index=1)
@@ -568,7 +656,7 @@ def test_receive_scopes_mtp_completeness_check_to_loading():
     )
 
     def load(weights):
-        assert not is_mtp_completeness_check_enabled()
+        assert is_mtp_completeness_check_enabled() is generic_ipc
         raise RuntimeError("load failed")
 
     engine.model.load_weights.side_effect = load

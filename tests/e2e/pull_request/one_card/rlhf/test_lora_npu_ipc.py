@@ -7,7 +7,7 @@ The standalone entry point runs the same assertions without importing pytest's
 model-level conftest. To use a prepared local model and retain the evidence:
 
     python tests/e2e/pull_request/one_card/rlhf/test_lora_npu_ipc.py \\
-        --model /home/z00850655/serving/lora-npu-ipc-20261123/models/Qwen3-0.6B \\
+        --model /models/Qwen3-0.6B \\
         --local-files-only --work-dir /tmp/lora-npu-ipc-e2e
 """
 
