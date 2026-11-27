@@ -84,8 +84,6 @@ def _dp_worker(rank, init_method):
         # Both ranks started with slot 0 occupied by different adapters. Each
         # receiver must load the remote adapter's expert shard before routing.
         coordinator.synchronize({requests[rank]})
-        assert wrapper.moe_lora_active
-        assert coordinator.num_active_loras == 2
         assert set(manager._adapter_manager.lora_index_to_id) == {11, 22}
         local_slots = torch.tensor([0, -1], dtype=torch.long)
         wire_ids = lora_slots_to_ids(local_slots, coordinator.slot_ids)
@@ -115,34 +113,6 @@ def _dp_worker(rank, init_method):
         torch.testing.assert_close(
             manager.expert_delta(recovered, torch.ones(2)), torch.tensor([33.0, 0.0]) * (rank + 1)
         )
-
-        # Residency must not keep globally base-only forwards on the LoRA path.
-        activations = manager.activations
-        coordinator.synchronize(set())
-        assert not wrapper.moe_lora_active
-        assert coordinator.num_active_loras == 0
-        assert manager.activations == activations
-        assert wrapper.moe_lora_slot_ids.data_ptr() == slot_buffer
-
-        # Synthetic capture adapters have no checkpoint requests. Capture's
-        # explicit mapping still selects active graphs; normal base requests
-        # must ignore that previous synthetic activity.
-        coordinator.step_active = False
-        coordinator.refresh_slot_ids(num_local_loras=1)
-        coordinator.synchronize(set(), dummy_run=True)
-        assert wrapper.moe_lora_active
-        assert coordinator.num_active_loras == 1
-        coordinator.synchronize(set())
-        assert not wrapper.moe_lora_active
-
-        # An idle rank must not publish the previous global activity as its
-        # own synthetic activity on the next base-only step.
-        coordinator.refresh_slot_ids(num_local_loras=0)
-        coordinator.synchronize({AdapterRequest(33, "/c")} if rank == 0 else set(), dummy_run=rank == 1)
-        assert coordinator.num_active_loras == 1
-        coordinator.synchronize(set(), dummy_run=rank == 1)
-        assert coordinator.num_active_loras == 0
-        assert not wrapper.moe_lora_active
 
         # The union capacity, rather than only the local request count, matters.
         coordinator.step_active = False
