@@ -28,7 +28,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._lora_shrink_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self._lora_triton_workspaces: dict[int, torch.Tensor] = {}
         self.lora_config = kwargs.get("lora_config")
-        self.active_lora_slots: frozenset[int] = frozenset()
         # Published by the runner's cross-DP expert adapter coordinator.
         self.moe_lora_slot_ids: torch.Tensor | None = None
         self.moe_lora_active: bool | None = None
@@ -113,11 +112,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         )
         # PunicaWrapperBase computes this only for prefill. Decode must also
         # choose between the active-LoRA and base-only quantized MoE paths.
-        active_ids = {lora_id for lora_id in mapping.index_mapping if lora_id > 0}
-        self.no_lora = not active_ids
-        self.active_lora_slots = frozenset(
-            slot for slot, lora_id in enumerate(lora_index_to_id) if lora_id in active_ids
-        )
+        self.no_lora = not any(lora_id > 0 for lora_id in mapping.index_mapping)
 
     def _shrink_prefill(
         self,
